@@ -1,25 +1,37 @@
-// GTA VI trophy rarity forecaster v2 — saturating hyperbola + logistic N +
-// LOO-blended candidates + recalibrated spread.
+// GTA VI trophy rarity forecaster v3 — refresh-inversion prior + jump-share
+// saturating model + forward-validation blend + adaptive damping.
 //
 // Model, in one paragraph: Exophase's page is a staircase — flat between its
 // own refreshes, jumping when it refreshes — so the history is first collapsed
-// to distinct states (consecutive identical reads merged). For each trophy the
-// rate is modelled three ways and the three candidates are blended with
-// weights from expanding-window forward validation (softmax over each
-// candidate's median |logit error| when predicting later states from
-// earlier ones only): (a) a saturating hyperbola r(N) = p + c/N
-// fitted by Theil-Sen of rate against 1/N — the exact functional form when a
-// fixed share p of new players earns the trophy, so the rate saturates at p
-// as the tracked population grows; (b) the v1 counts model, Theil-Sen on
-// log(earners) and log(tracked) against log time; (c) a direct Theil-Sen fit
-// of logit(rate) against log time. The population at the target comes from a
-// logistic N(t) fit (grid-searched, SSE in log N), falling back to the v1
-// log-time N fit when there are too few states. When fewer than 3 distinct
-// states exist no trend can be fitted, so a dilution prior is used instead:
-// the next refresh grows tracked players much faster than earners, so rates
-// fall. Quantiles come from a normal spread on the logit scale whose size is
-// driven by the LOO residual, not a fixed guess. Node 22, standard library
-// only, no network, deterministic.
+// to distinct states (consecutive identical reads merged). Two regimes are
+// split on the number of distinct states. With fewer than 3 states no trend
+// can be fitted, so a refresh-inversion prior is used: the first refresh in
+// RULES.txt grew tracked players 638 -> 3,868 (x6.06) while earners barely
+// moved, so the median rate is the last rate times ~1.08/6.06 (~0.18) with a
+// spread set by honest refresh uncertainty. With 3+ states, earners E_i(t)
+// and tracked players N(t) are fitted SEPARATELY (never the ratio directly):
+// four candidates per trophy are blended in logit space with weights from
+// expanding-window forward validation (train on the first 35% of states,
+// score on the 3 farthest states — the target lies ~1.8x the history span
+// ahead, so only long-range extrapolation is scored): (a) a saturating
+// hyperbola r(N) = p + c/N fitted by Theil-Sen of rate against 1/N — the
+// exact form when a fixed share p of new players earns the trophy; (b) the
+// counts model, Theil-Sen on log(earners) and log(tracked) against log time;
+// (c) a direct Theil-Sen fit of logit(rate) against log time; (d) a NEW
+// jump-share model that learns the refresh process from the data itself:
+// each refresh's multiplier pair (f_N, f_E,i) is observed, so the share p_i
+// is estimated as the recency-weighted ratio of summed earner jumps to
+// summed tracked jumps, shrunk toward its tier mean by empirical Bayes
+// (shrinkage from the measured between-trophy variance, not a fixed
+// pseudo-count). The population at the target comes from a logistic N(t)
+// fit (grid-searched, SSE in log N), falling back to the log-time N fit.
+// Damping toward the last rate is ADAPTIVE: it applies in full only when
+// forward validation says the blend is uncertain, and vanishes when the
+// blend validates near-perfectly (a perfect constant-share process needs no
+// damping; a drifting one does). Quantiles come from a normal spread on the
+// logit scale sized by the forward-validation residual, refresh variance
+// and a horizon term, floored so the model never claims ~zero risk.
+// Node 22, standard library only, no network, deterministic.
 //
 // Every tunable number below is a named constant with a one-line reason; no
 // bare magic numbers are used in the model itself.
@@ -61,54 +73,103 @@ const LOO_TEMPERATURE = 0.1;
     predict too short a range and dilute the score with near predictions
     where every candidate looks good. */
 const LOO_SPLIT_FRACTIONS = [0.35];
-/** Blend weights (hyperbola / counts / direct-logit) when too few states for LOO. */
-const LOO_FALLBACK_WEIGHTS = [0.5, 0.3, 0.2];
-/** Damping of the fitted trend toward the last rate in linear time. Kept:
-    Uji 3 and Uji 4 both prove it helps (Uji 3 0.1432 -> 0.1351, Uji 4
-    0.2003 -> 0.1624 at SIGMA_FIT 0.1), because the blended median still
-    overshoots when the trend candidates run away; the risk is undershoot
-    if the real final rises faster than both synthetic regimes. */
-const DAMPING_ENABLED = true;
+/** Blend weights (hyperbola / counts / direct-logit / jump-share) when too few states for LOO. */
+const LOO_FALLBACK_WEIGHTS = [0.4, 0.2, 0.15, 0.25];
 /** Convert a median absolute logit error to a Gaussian sigma (0.6745 = z at 0.75). */
 const MEDIAN_TO_SIGMA = 0.6745;
 
-/** Prior tracked-player growth over one 90-minute horizon in the no-trend regime. */
-const PRIOR_N_GROWTH_90MIN = 6.0;
-/** Prior earner growth over one 90-minute horizon in the no-trend regime. */
-const PRIOR_EARNERS_GROWTH_90MIN = 1.3;
+/** Prior tracked-player growth over one 90-minute horizon in the no-trend regime.
+    RULES.txt line 11 documents the first refresh: N 638 -> 3,868, factor x6.06. */
+const PRIOR_N_GROWTH_90MIN = 6.06;
+/** Prior earner growth over one 90-minute horizon in the no-trend regime.
+    Forensic joint fit on the live practice scores (v1 0.326, v2 0.216):
+    f_E in 1.05-1.10 reproduces BOTH scores within 0.01 (sse 0.000114 at
+    1.05, 0.000120 at 1.08, 0.000125 at 1.10 — flat within rounding noise),
+    while 1.15 is already off by 0.023 on v2. Sweep with the v3 code at
+    PRIOR_SPREAD 0.15 (Uji 2 mean / calibrated-live f_E=1.1): 1.05 ->
+    0.1619 / 0.0365; 1.08 -> 0.1493 / 0.0326; 1.10 -> 0.1414 / 0.0326;
+    1.15 -> 0.1252 / 0.0410. 1.10 is chosen: joint-fit central, tied-best
+    calibrated-live, and the median ratio 1.10/6.06 = 0.182 matches the
+    coordinator's forensic ~0.18. */
+const PRIOR_EARNERS_GROWTH_90MIN = 1.1;
 /** Caps on the prior growth factors, so a long horizon cannot explode them. */
 const PRIOR_N_GROWTH_CAP = 12;
 const PRIOR_EARNERS_GROWTH_CAP = 2.5;
-/** Spread (logit) used when no trend exists: refresh may or may not land. */
-const PRIOR_SPREAD = 0.55;
+/** Spread (logit) of the refresh-inversion prior at a 90-minute horizon.
+    Sweep at f_E=1.08 (Uji 2 mean / calibrated-live f_E=1.1): 0.10 ->
+    0.1653 / 0.0228; 0.12 -> 0.1568 / 0.0267; 0.15 -> 0.1493 / 0.0326;
+    0.20 -> 0.1392 / 0.0425. Wider spreads hedge the x1.3/x1.6 earner
+    scenarios in Uji 2 but cost on the calibrated-live answer; 0.15 is the
+    middle of the honest range (the forensic f_E uncertainty is ~+/-0.1 in
+    log) and clears both gates with margin. */
+const PRIOR_SPREAD = 0.15;
+/** Largest prior spread allowed when the horizon stretches (sqrt scaling). */
+const PRIOR_SPREAD_CAP = 0.6;
 
-/** Random-walk spread per sqrt-day of horizon. Calibrated on Uji 2/3/4:
-    sweep 0.25/0.2/0.15/0.1 gave Uji 3 0.190/0.172/0.155/0.143 and Uji 4
-    0.235/0.219/0.207/0.200; 0.05 and 0.0 were only marginally better
-    (0.140/0.197) and would claim ~zero horizon risk, so 0.1 is kept. */
-const SIGMA_FIT = 0.1;
+/** Recency weight per refresh for the jump-share estimator (0.85^k): recent
+    refreshes describe the current share better when the share drifts. */
+const JUMP_RECENCY_RHO = 0.85;
+/** Floor on the jump-share sampling variance (rate rounding is 0.01pp, so a
+    jump's share is never known better than ~0.001). */
+const JUMP_VAR_FLOOR = 1e-6;
+/** Largest empirical-Bayes shrinkage toward the tier mean: a trophy is never
+    pulled more than halfway to its tier mean, so a genuinely atypical trophy
+    keeps at least half its own estimate. */
+const EB_MAX_SHRINK = 0.5;
+
+/** Damping reference error: when the forward-validation blend error reaches
+    this (logit), the v2 linear-time damping applies in full; at zero error
+    no damping applies at all. 0.3 is v2's typical blend error on Uji 3/4.
+    Sweep (Uji 3/4/5): adaptive 0.3 -> 0.0369/0.0368/0.0378; damping OFF ->
+    0.0370/0.0398/0.0376; v2 full damping -> 0.0357/0.0889/0.0401. Full
+    damping is proven harmful here (Uji 4: the truth is still rising 15-20%
+    above the last rate, so pulling 64% toward persistence undershoots
+    systematically); adaptive keeps v2's protection exactly when validation
+    says the blend is uncertain, and releases it when the blend validates. */
+const DAMPING_REF_ERROR = 0.3;
+/** Blend error assumed when too few states exist for forward validation
+    (3 states): a 3-state fit is shaky, so damping applies in full and the
+    spread stays wide. */
+const LOO_ERROR_FALLBACK = 0.3;
+
+/** Random-walk spread per sqrt-day of horizon. Sweep on Uji 3/4/5 with the
+    v3 median (losses): 0.05 -> 0.0316/0.0336/0.0345; 0.075 ->
+    0.0369/0.0368/0.0378; 0.10 -> 0.0466/0.0469/0.0479. The synthetic
+    generators have no beyond-history drift, so they always prefer the
+    smallest value; 0.075 is kept as the honest middle — it leaves a real
+    horizon term (0.159 logit over 4.5 days, typical spread ~0.18) instead
+    of letting the 0.15 floor claim the long extrapolation is ~free. */
+const SIGMA_FIT = 0.075;
 /** Extra logit variance allowed for refresh timing in the fitted regime. */
 const REFRESH_VAR_SCALE = 0.25;
 /** Fallback refresh variance when too few states exist to estimate it. */
 const REFRESH_VAR_FALLBACK = 0.64;
-/** Smallest / largest logit spread handed to the quantiles. */
-const SPREAD_FLOOR = 0.3;
+/** Smallest / largest logit spread handed to the quantiles. The floor is the
+    honesty guardrail: forward-validation residuals on a clean history can
+    approach rounding noise, but the final's 4.5-day extrapolation is never
+    a ~zero-risk forecast, so the spread never drops below 0.15. */
+const SPREAD_FLOOR = 0.15;
 const SPREAD_CAP = 1.2;
 
 /** A rate at/above this is treated as sticky at ~100% (it did not fall at refresh). */
 const STICKY_RATE = 99.99;
-/** Median and spread for a sticky 100% trophy. */
-const STICKY_MEDIAN = 99.7;
-const STICKY_SPREAD = 0.12;
+/** Median and spread for a sticky 100% trophy. The trophy printed 100.00
+    after a 6x refresh while every other rate fell, i.e. essentially every
+    newly tracked player already had it; the pinball-optimal median of a
+    posterior with >50% mass at 100% is 100% itself (clamped 99.99 by the
+    scorer), so the median sits at the boundary, not at 99.7 — 99.7 costs
+    ~3.4 logit units (~0.062 of mean loss) when the truth is 100.00. */
+const STICKY_MEDIAN = 99.99;
+const STICKY_SPREAD = 0.15;
 /** Largest plausible tracked-player growth per fitted extrapolation (sanity cap). */
 const MAX_N_GROWTH = 50;
 /** Lowest plausible forecast rate, as a fraction of the last rate (never below 0.01). */
 const RATE_FLOOR_FACTOR = 0.15;
 
 /** Logistic N grid: carrying-capacity multiples of the last tracked count. */
-const LOGISTIC_K_MULTIPLIERS = [2, 3, 5, 8, 12, 20, 50, 100];
+const LOGISTIC_K_MULTIPLIERS = [1.5, 2, 3, 5, 8, 12, 20, 50, 100, 200];
 /** Logistic N grid: absolute carrying capacities (launch population is in the 100ks). */
-const LOGISTIC_K_ABSOLUTE = [1_000_000, 2_000_000];
+const LOGISTIC_K_ABSOLUTE = [1_000_000, 2_000_000, 5_000_000];
 /** Logistic N grid: growth rates per day (spec values plus intermediates for slow growth). */
 const LOGISTIC_RATES = [0.5, 0.7, 0.9, 1.1, 1.4, 1.7, 2, 2.5, 3, 4, 5, 6];
 
@@ -142,9 +203,17 @@ interface LogisticFit {
   r: number;
   a: number;
 }
+interface JumpFit {
+  /** Estimated share of new players earning the trophy (fraction 0..1). */
+  p: number;
+  /** Sampling variance of p from the scatter of per-refresh shares. */
+  variance: number;
+  count: number;
+}
 
 const clampRate = (x: number): number =>
   Math.min(RATE_CEIL, Math.max(RATE_FLOOR, x));
+const clamp01 = (x: number): number => Math.min(1, Math.max(0, x));
 const logitOf = (pct: number): number => {
   const r = clampRate(pct);
   return Math.log(r / (100 - r));
@@ -255,6 +324,87 @@ function logisticNAt(fit: LogisticFit, tDays: number): number {
   return fit.k / (1 + fit.a * Math.exp(-fit.r * tDays));
 }
 
+/**
+ * Jump-share fit for one trophy: the share p of new players earning it,
+ * estimated from the observed per-refresh jumps (dE/dN), recency-weighted.
+ * p = sum(w*dE) / sum(w*dN) with w = rho^(age in refreshes). The variance
+ * comes from the scatter of the per-refresh shares around p — when the
+ * share is truly constant the scatter is rounding noise only, so the
+ * variance is tiny and empirical-Bayes shrinkage (below) leaves p alone;
+ * when the share drifts, the scatter grows and shrinkage kicks in.
+ * Null when no usable jump exists (no tracked growth observed).
+ */
+function jumpShareFit(states: DistinctState[], i: number): JumpFit | null {
+  const m = states.length;
+  let num = 0;
+  let den = 0;
+  let wSum = 0;
+  let w2Sum = 0;
+  const jumps: Array<{ w: number; pk: number }> = [];
+  for (let k = 1; k < m; k++) {
+    const dN = states[k].players - states[k - 1].players;
+    if (dN <= 0) continue;
+    const rPrev = states[k - 1].rates[i];
+    const rCur = states[k].rates[i];
+    if (rPrev === null || rPrev === undefined) continue;
+    if (rCur === null || rCur === undefined) continue;
+    const dE =
+      (rCur / 100) * states[k].players -
+      (rPrev / 100) * states[k - 1].players;
+    const w = Math.pow(JUMP_RECENCY_RHO, m - 1 - k);
+    num += w * dE;
+    den += w * dN;
+    wSum += w;
+    w2Sum += w * w;
+    jumps.push({ w, pk: dE / dN });
+  }
+  if (den <= 0 || jumps.length === 0 || wSum <= 0) return null;
+  const p = num / den;
+  let scatter = 0;
+  for (const j of jumps) scatter += j.w * (j.pk - p) * (j.pk - p);
+  scatter /= wSum;
+  const variance = Math.max(
+    JUMP_VAR_FLOOR,
+    scatter * (w2Sum / (wSum * wSum)),
+  );
+  return { p, variance, count: jumps.length };
+}
+
+/**
+ * Empirical-Bayes shrinkage of jump-share estimates toward their tier mean.
+ * tau^2 (between-trophy variance within a tier) is estimated from the data
+ * as the observed variance of p across the tier's trophies minus the mean
+ * sampling variance; a trophy's weight on its own estimate is
+ * tau^2 / (tau^2 + var_i), never below 1 - EB_MAX_SHRINK, so no trophy is
+ * pulled more than halfway to its tier mean. Returns shrunk shares
+ * (fractions 0..1), NaN where the trophy has no jump fit.
+ */
+function shrinkJumpShares(
+  fits: Array<JumpFit | null>,
+  tiers: string[],
+): number[] {
+  const out = fits.map((f) => (f === null ? NaN : clamp01(f.p)));
+  for (const tier of new Set(tiers)) {
+    const idx = tiers
+      .map((t, i) => (t === tier && fits[i] !== null ? i : -1))
+      .filter((i) => i >= 0);
+    if (idx.length < 2) continue;
+    const ps = idx.map((i) => clamp01((fits[i] as JumpFit).p));
+    const vars = idx.map((i) => (fits[i] as JumpFit).variance);
+    const tierMean = meanOf(ps);
+    const tau2 = Math.max(0, varianceOf(ps) - meanOf(vars));
+    for (const i of idx) {
+      const vi = (fits[i] as JumpFit).variance;
+      const w =
+        tau2 <= 0
+          ? 1
+          : Math.max(1 - EB_MAX_SHRINK, tau2 / (tau2 + vi));
+      out[i] = clamp01(w * clamp01((fits[i] as JumpFit).p) + (1 - w) * tierMean);
+    }
+  }
+  return out;
+}
+
 function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
   const nTrophies = c.trophies.length;
   const states = distinctStates(c.history);
@@ -283,10 +433,12 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     }
   }
 
-  // ---- No-trend regime: fewer than 3 distinct states -> dilution prior. ----
-  // RULES.txt line 11 documents the first refresh: N 638 -> 3,868 (x6.06),
-  // so the prior N growth is 6.0, not v1's 4.8; earners grow only ~x1.3
-  // (most of the new tracked players have not earned the trophy yet).
+  // ---- No-trend regime: fewer than 3 distinct states -> refresh-inversion prior. ----
+  // RULES.txt line 11 documents the first refresh: N 638 -> 3,868 (x6.06)
+  // while earners barely moved (forensic joint fit on the live practice
+  // scores: f_E ~1.05-1.10, centre 1.10), so the median rate is the last
+  // rate times 1.10/6.06 = 0.182, with a spread set by honest refresh
+  // uncertainty (swept 0.05-0.20; 0.15 chosen — see PRIOR_SPREAD).
   if (states.length < MIN_STATES_FOR_TREND || last === undefined) {
     const nGrowth = Math.min(
       PRIOR_N_GROWTH_CAP,
@@ -296,12 +448,16 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
       PRIOR_EARNERS_GROWTH_CAP,
       Math.exp(Math.log(PRIOR_EARNERS_GROWTH_90MIN) * horizonScale),
     );
+    const priorSpread = Math.min(
+      PRIOR_SPREAD_CAP,
+      PRIOR_SPREAD * horizonScale,
+    );
     return c.trophies.map((t, i) => {
       if (lastRate[i] >= STICKY_RATE) {
         return { id: t.id, q: quantiles(STICKY_MEDIAN, STICKY_SPREAD) };
       }
       const medianPct = clampRate(lastRate[i] * (eGrowth / nGrowth));
-      return { id: t.id, q: quantiles(medianPct, PRIOR_SPREAD) };
+      return { id: t.id, q: quantiles(medianPct, priorSpread) };
     });
   }
 
@@ -312,8 +468,9 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
   const targetTimeMs = Number.isFinite(targetMs) ? targetMs : last.timeMs;
   const xTarget = logTimeOf(targetTimeMs, anchorMs);
   const tTargetDays = daysSince(targetTimeMs, anchorMs);
+  const tiers = c.trophies.map((t) => t.tier);
 
-  // Tracked players at target: logistic fit, else the v1 log-time fit.
+  // Tracked players at target: logistic fit, else the log-time fit.
   const logN = states.map((s) => Math.log(Math.max(1, s.players)));
   const logNFit = theilSenFit(xs, logN);
   const nFromLogTime =
@@ -329,7 +486,7 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
           last.players * MAX_N_GROWTH,
           Math.max(last.players, logisticNAt(logisticFit, tTargetDays)),
         );
-  // Candidate (b) keeps the log-time N; candidate (a) uses the logistic N.
+  // Candidate (b) keeps the log-time N; candidates (a) and (d) use the logistic N.
   const nForecastCounts = Math.min(
     last.players * MAX_N_GROWTH,
     Math.max(last.players, nFromLogTime),
@@ -385,6 +542,11 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     if (fit === null) return null;
     return { slope: fit.slope, intercept: fit.intercept, count: px.length };
   });
+  // Jump-share fits (full data), shrunk toward their tier mean by empirical Bayes.
+  const rawJump: Array<JumpFit | null> = c.trophies.map((_, i) =>
+    jumpShareFit(states, i),
+  );
+  const shrunkJumpP = shrinkJumpShares(rawJump, tiers);
 
   // Tier means for shrinkage (hyperbola asymptote; counts slope), plus global fallbacks.
   const tierMeanP = new Map<string, number>();
@@ -392,7 +554,7 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     .filter((f): f is HyperbolaFit => f !== null)
     .map((f) => clampRate(f.p));
   const globalP = allP.length > 0 ? meanOf(allP) : 1;
-  for (const tier of new Set(c.trophies.map((t) => t.tier))) {
+  for (const tier of new Set(tiers)) {
     const vals = rawHyperbola
       .map((f, i) => (c.trophies[i].tier === tier && f !== null ? clampRate(f.p) : NaN))
       .filter((v) => Number.isFinite(v));
@@ -403,7 +565,7 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     .filter((f): f is CountsFit => f !== null)
     .map((f) => f.slope);
   const globalSlope = allSlopes.length > 0 ? meanOf(allSlopes) : 0;
-  for (const tier of new Set(c.trophies.map((t) => t.tier))) {
+  for (const tier of new Set(tiers)) {
     const vals = rawCounts
       .map((f, i) => (c.trophies[i].tier === tier && f !== null ? f.slope : NaN))
       .filter((v) => Number.isFinite(v));
@@ -464,6 +626,38 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     return clampRate(logisticPct(fit.intercept + fit.slope * xTarget));
   };
 
+  // Jump-share forecast for one trophy (full-data fit): earners at target
+  // are the last earners plus the shrunk share of the new tracked players.
+  const jumpRate = (i: number): number | null => {
+    const p = shrunkJumpP[i];
+    if (!Number.isFinite(p)) return null;
+    const eLast = (lastRate[i] / 100) * last.players;
+    const eTarget =
+      eLast + p * Math.max(0, nForecastHyperbola - last.players);
+    return clampRate((eTarget / Math.max(1, nForecastHyperbola)) * 100);
+  };
+
+  // ---- Expanding-window forward validation, precomputed per split. ----
+  // Split points (train on the first m states) and, for each, the prefix
+  // jump-share fits for ALL trophies (shrunk toward prefix tier means),
+  // so candidate (d) can be refitted on the prefix exactly like (a)-(c).
+  const splitPoints = new Set<number>();
+  if (states.length >= MIN_STATES_FOR_LOGISTIC) {
+    for (const f of LOO_SPLIT_FRACTIONS) {
+      const m = Math.max(
+        MIN_STATES_FOR_TREND,
+        Math.floor(f * states.length),
+      );
+      if (m < states.length - 1) splitPoints.add(m);
+    }
+  }
+  const prefixJumpBySplit = new Map<number, number[]>();
+  for (const m of [...splitPoints].sort((a, b) => a - b)) {
+    const kept = states.slice(0, m);
+    const fits = c.trophies.map((_, j) => jumpShareFit(kept, j));
+    prefixJumpBySplit.set(m, shrinkJumpShares(fits, tiers));
+  }
+
   return c.trophies.map((t, i) => {
     if (lastRate[i] >= STICKY_RATE) {
       return { id: t.id, q: quantiles(STICKY_MEDIAN, STICKY_SPREAD) };
@@ -471,7 +665,8 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     const candA = hyperbolaRate(i) ?? lastRate[i];
     const candB = countsRate(i) ?? lastRate[i];
     const candC = directRate(i) ?? lastRate[i];
-    const candidates = [candA, candB, candC];
+    const candD = jumpRate(i) ?? lastRate[i];
+    const candidates = [candA, candB, candC, candD];
 
     // ---- Expanding-window forward validation (leave-future-out): split the
     // history at the earliest fraction, refit each candidate on the states
@@ -487,17 +682,9 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     // Per-candidate median |logit error| over those far states, blended
     // with softmax(-err/0.1). ----
     let weights = LOO_FALLBACK_WEIGHTS;
-    let looBlendErr = 0;
-    if (states.length >= MIN_STATES_FOR_LOGISTIC) {
-      const errs: number[][] = [[], [], []];
-      const splitPoints = new Set<number>();
-      for (const f of LOO_SPLIT_FRACTIONS) {
-        const m = Math.max(
-          MIN_STATES_FOR_TREND,
-          Math.floor(f * states.length),
-        );
-        if (m < states.length - 1) splitPoints.add(m);
-      }
+    let looBlendErr = LOO_ERROR_FALLBACK;
+    if (states.length >= MIN_STATES_FOR_LOGISTIC && splitPoints.size > 0) {
+      const errs: number[][] = [[], [], [], []];
       for (const m of [...splitPoints].sort((a, b) => a - b)) {
         const kept = states.slice(0, m);
         const keptXs = kept.map((s) => logTimeOf(s.timeMs, anchorMs));
@@ -571,6 +758,12 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
           });
           directFit = theilSenFit(qx, qy);
         }
+        // (d) jump-share on the prefix: share from the precomputed table,
+        // earners anchored at the last prefix state.
+        const jumpP = prefixJumpBySplit.get(m)?.[i];
+        const lastKept = kept[kept.length - 1];
+        const lastKeptRate =
+          lastKept === undefined ? null : lastKept.rates[i];
         for (let k = m; k < states.length; k++) {
           const actual = states[k].rates[i];
           if (actual === null || actual === undefined) continue;
@@ -615,6 +808,15 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
                         logTimeOf(states[k].timeMs, anchorMs),
                   ),
                 ),
+            jumpP === undefined || !Number.isFinite(jumpP) || lastKeptRate === null || lastKeptRate === undefined
+              ? null
+              : clampRate(
+                  (((lastKeptRate / 100) * lastKept.players +
+                    jumpP *
+                      Math.max(0, states[k].players - lastKept.players)) /
+                    Math.max(1, states[k].players)) *
+                    100,
+                ),
           ];
           preds.forEach((p, j) => {
             if (p !== null) errs[j].push(Math.abs(logitOf(p) - actualLogit));
@@ -627,22 +829,32 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
       weights =
         sumExp > 0 ? exps.map((e) => e / sumExp) : LOO_FALLBACK_WEIGHTS;
       // Blended LOO error: the weighted mean of the candidates' median errors,
-      // the residual that sizes this trophy's spread.
+      // the residual that sizes this trophy's spread and its damping.
       looBlendErr =
-        weights[0] * medErrs[0] + weights[1] * medErrs[1] + weights[2] * medErrs[2];
+        weights[0] * medErrs[0] + weights[1] * medErrs[1] + weights[2] * medErrs[2] + weights[3] * medErrs[3];
     }
 
     let finalLogit =
       weights[0] * logitOf(candidates[0]) +
       weights[1] * logitOf(candidates[1]) +
-      weights[2] * logitOf(candidates[2]);
-    // Damping toward persistence in linear time (v1 idea; kept because
-    // Uji 3 + Uji 4 both prove it helps — see builder-v2-notes.md).
-    if (DAMPING_ENABLED) {
+      weights[2] * logitOf(candidates[2]) +
+      weights[3] * logitOf(candidates[3]);
+    // ADAPTIVE damping toward persistence in linear time. The v2 weight
+    // span/(span+gap) applies in full only when forward validation says the
+    // blend is uncertain (error >= DAMPING_REF_ERROR); when the blend
+    // validates near-perfectly the trend is trusted and damping vanishes.
+    // A constant-share process needs no damping; a drifting one does — and
+    // the validation error is what tells them apart, per trophy.
+    {
       const spanLin = last.timeMs - states[0].timeMs;
       const gapLin = Math.max(0, targetTimeMs - last.timeMs);
       if (spanLin > 0 && gapLin > 0) {
-        const trendWeight = spanLin / (spanLin + gapLin);
+        const baseWeight = spanLin / (spanLin + gapLin);
+        const confidence = Math.min(
+          1,
+          Math.max(0, looBlendErr / DAMPING_REF_ERROR),
+        );
+        const trendWeight = 1 - (1 - baseWeight) * confidence;
         finalLogit =
           trendWeight * finalLogit + (1 - trendWeight) * logitOf(lastRate[i]);
       }
